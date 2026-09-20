@@ -48,3 +48,4 @@ esptool.py --chip esp32c3 --port COMx write_flash 0x0 firmware.bin
 | `GET /api/clear` | Xoa toan bo EEPROM |
 | `GET /api/autosave?on=1` | Bat/tat tu dong luu |
 # ESP-GRABER-Web
+# ESP-GRABER-Web
