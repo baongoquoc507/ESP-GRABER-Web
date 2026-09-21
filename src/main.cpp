@@ -310,6 +310,8 @@ void setupCC1101() {
   ELECHOUSE_cc1101.SetRx();
 }
 
+void stopJammingInline();
+
 void restoreReceiveMode() {
   if (isJamming) stopJammingInline();
   ELECHOUSE_cc1101.Init();
