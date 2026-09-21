@@ -11,6 +11,7 @@
 #define CC1101_SCK  4
 #define CC1101_MOSI 7
 #define CC1101_MISO 6
+#define LED_PIN     8   // Den onboard ESP32-C3 super mini (mot so board dung GPIO8)
 
 // ===================== WIFI AP =====================
 const char* AP_SSID = "quốc bảo";
@@ -37,6 +38,7 @@ WebServer server(80);
 #define EEPROM_SIZE 2048
 
 volatile bool recieved = false;
+bool cc1101_ok = false;
 
 enum emKeys { kUnknown, kP12bt, k12bt, k24bt, k64bt, kKeeLoq, kANmotors64, kPrinceton, kRcSwitch, kStarLine, kCAME, kNICE, kHOLTEK };
 enum emMode { MODE_IDLE, MODE_RECV, MODE_ANALYZER };
@@ -64,6 +66,8 @@ byte maxKeyCount = MAX_KEY_COUNT;
 byte EEPROM_key_count;
 byte EEPROM_key_index = 0;
 unsigned long scanTimer = 0;
+unsigned long ledTimer = 0;
+bool ledState = false;
 bool validKeyReceived = false;
 bool readRAW = true;
 bool autoSave = false;
@@ -74,6 +78,7 @@ tpKeyData txKey;
 float detected_frequency = 0.0;
 float last_detected_frequency = 0.0;
 bool isJamming = false;
+int wifiTxPowerDbx10 = 130;  // Cong suat phat WiFi (dBm x10), mac dinh 13 dBm
 
 // ===================== HTML UI =====================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
@@ -174,6 +179,19 @@ select,input{background:#0d1117;color:var(--fg);border:1px solid #30363d;border-
   <div class="kv"><span>IP</span><b id="ipAddr">192.168.4.1</b></div>
   <div class="kv"><span>Số key đã lưu</span><b id="keyCount">0</b></div>
   <div class="kv"><span>Auto-save</span><b id="autoSaveState">TẮT</b></div>
+  <div class="kv"><span>Công suất WiFi</span><b id="txPowerCur">13 dBm</b></div>
+  <div class="row" style="margin-top:10px">
+    <select id="txPowerSel">
+      <option value="8.5">8.5 dBm</option>
+      <option value="11">11 dBm</option>
+      <option value="13" selected>13 dBm</option>
+      <option value="15">15 dBm</option>
+      <option value="17">17 dBm</option>
+      <option value="19.5">19.5 dBm (MAX)</option>
+    </select>
+    <button class="sec" onclick="setTxPower()">📶 Đặt</button>
+  </div>
+  <div id="ccState" class="kv"><span>CC1101</span><b>Đang kiểm tra...</b></div>
   <div class="row" style="margin-top:10px">
     <button class="sec" onclick="toggleAutoSave()">🔄 Bật/Tắt Auto-save</button>
     <button class="danger" onclick="clearEEPROM()">🗑️ Xóa EEPROM</button>
@@ -205,6 +223,9 @@ async function pollStatus(){
   $("keyCount").textContent=s.keys;
   $("ipAddr").textContent=s.ip;
   $("autoSaveState").textContent=s.autosave?"BẬT":"TẮT";
+  $("txPowerCur").textContent=s.txpower+" dBm";
+  $("txPowerSel").value=parseFloat(s.txpower);
+  $("ccState").innerHTML="<span>CC1101</span><b>"+(s.ccok?"✅ Hoạt động":"❌ Không kết nối!")+"</b>";
   $("jamState").textContent=s.jamming?"ĐANG JAM ⚠️":"TẮT";
   $("jamBtn").textContent=s.jamming?"⏹ Dừng":"▶ Bật";
   if(s.mode==="recv"){
@@ -249,6 +270,11 @@ async function toggleJam(){
   const s=await api("/api/status");
   if(s.jamming){await api("/api/jam?on=0");}
   else{await api("/api/jam?on=1&freq="+$("jamFreq").value);}
+  pollStatus();
+}
+async function setTxPower(){
+  const r=await api("/api/txpower?db="+$("txPowerSel").value);
+  msg("setMsg",r.ok?"✅ Đã đặt công suất "+r.db+" dBm":"❌ "+(r.error||"Lỗi"),!!r.ok);
   pollStatus();
 }
 async function toggleAutoSave(){const r=await api("/api/autosave?toggle=1");msg("setMsg",r.ok?"✅ Auto-save: "+(r.on?"BẬT":"TẮT"):"❌ Lỗi",!!r.ok);pollStatus();}
@@ -298,6 +324,27 @@ void myDelayMcs(unsigned long dl) {
   else delayMicroseconds(dl);
 }
 
+void heartbeatLed() {
+  if (millis() - ledTimer >= 500) {
+    ledTimer = millis();
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  }
+}
+
+void applyTxPower() {
+  switch (wifiTxPowerDbx10) {
+    case 85:  WiFi.setTxPower(WIFI_POWER_8_5dBm);  break;
+    case 110: WiFi.setTxPower(WIFI_POWER_11dBm);   break;
+    case 130: WiFi.setTxPower(WIFI_POWER_13dBm);   break;
+    case 150: WiFi.setTxPower(WIFI_POWER_15dBm);   break;
+    case 170: WiFi.setTxPower(WIFI_POWER_17dBm);   break;
+    case 195: WiFi.setTxPower(WIFI_POWER_19_5dBm); break;
+    default:  WiFi.setTxPower(WIFI_POWER_13dBm);   break;
+  }
+  Serial.print(F("WiFi TX power: ")); Serial.print(wifiTxPowerDbx10 / 10.0); Serial.println(F(" dBm"));
+}
+
 void setupCC1101() {
   ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
   ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
@@ -310,10 +357,19 @@ void setupCC1101() {
   ELECHOUSE_cc1101.SetRx();
 }
 
+// Kiem tra CC1101 co phan hoi khong (VERSION register phai = 0x14)
+bool checkCC1101() {
+  byte ver = ELECHOUSE_cc1101.SpiReadStatus(0x31); // VERSION
+  Serial.print(F("CC1101 VERSION = 0x"));
+  Serial.println(ver, HEX);
+  return (ver == 0x14);
+}
+
 void stopJammingInline();
 
 void restoreReceiveMode() {
   if (isJamming) stopJammingInline();
+  if (!cc1101_ok) return;
   ELECHOUSE_cc1101.Init();
   ELECHOUSE_cc1101.setModulation(2);
   ELECHOUSE_cc1101.setMHZ(frequency);
@@ -514,6 +570,7 @@ void sendSynthKey(tpKeyData* kd) {
           digitalWrite(CC1101_GDO0, currentlogiclevel ? HIGH : LOW);
           myDelayMcs(transmittimings[currenttiming]);
           currenttiming++;
+          if ((currenttiming & 0x0F) == 0) yield(); // tranh lam treo WiFi khi phat raw dai
         }
         digitalWrite(CC1101_GDO0, LOW);
       }
@@ -548,8 +605,10 @@ void stopJammingInline() {
 void stopJamming() {
   Serial.println(F("Jammer OFF"));
   isJamming = false;
-  ELECHOUSE_cc1101.SpiWriteReg(0x35, 0x00);
-  restoreReceiveMode();
+  if (cc1101_ok) {
+    ELECHOUSE_cc1101.SpiWriteReg(0x35, 0x00);
+    restoreReceiveMode();
+  }
 }
 
 // ===================== HTTP API =====================
@@ -576,20 +635,23 @@ void handleStatus() {
   json += "\"keys\":" + String(EEPROM_key_count) + ",";
   json += "\"autosave\":" + String(autoSave ? "true" : "false") + ",";
   json += "\"jamming\":" + String(isJamming ? "true" : "false") + ",";
+  json += "\"ccok\":" + String(cc1101_ok ? "true" : "false") + ",";
   json += "\"valid\":" + String(validKeyReceived ? "true" : "false") + ",";
   json += "\"code\":\"" + keyCodeHex(&keyData1) + "\",";
   json += "\"type\":\"" + getTypeName(keyData1.type) + "\",";
   json += "\"bits\":" + String(keyData1.bitLength) + ",";
-  int rssi = ELECHOUSE_cc1101.getRssi();
+  int rssi = cc1101_ok ? ELECHOUSE_cc1101.getRssi() : -128;
   json += "\"rssi\":" + String(rssi) + ",";
   json += "\"scanning\":" + String(subghz_frequency_list[current_scan_index], 2) + ",";
   json += "\"detected\":" + String(last_detected_frequency, 2) + ",";
+  json += "\"txpower\":" + String(wifiTxPowerDbx10 / 10.0, 1) + ",";
   json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
   json += "}";
   sendJson(json);
 }
 
 void handleRecv() {
+  if (!cc1101_ok) { sendJson("{\"ok\":false,\"error\":\"CC1101 khong ket noi - kiem tra day!\"}"); return; }
   if (server.hasArg("freq")) {
     float f = server.arg("freq").toFloat();
     for (int i = 0; i < numFrequencies; i++) {
@@ -638,6 +700,7 @@ void handleKeys() {
 }
 
 void handleSend() {
+  if (!cc1101_ok) { sendJson("{\"ok\":false,\"error\":\"CC1101 khong ket noi\"}"); return; }
   if (!server.hasArg("i")) { sendJson("{\"ok\":false,\"error\":\"Thieu tham so\"}"); return; }
   byte idx = server.arg("i").toInt();
   if (idx < 1 || idx > EEPROM_key_count) { sendJson("{\"ok\":false,\"error\":\"Key khong ton tai\"}"); return; }
@@ -661,6 +724,7 @@ void handleDel() {
 
 void handleAnalyzer() {
   if (server.hasArg("on") && server.arg("on") == "1") {
+    if (!cc1101_ok) { sendJson("{\"ok\":false,\"error\":\"CC1101 khong ket noi\"}"); return; }
     stopJamming();
     setupCC1101();
     rcswitch.disableReceive();
@@ -672,13 +736,14 @@ void handleAnalyzer() {
     sendJson("{\"ok\":true}");
   } else {
     if (mode == MODE_ANALYZER) mode = MODE_IDLE;
-    restoreReceiveMode();
+    if (cc1101_ok) restoreReceiveMode();
     sendJson("{\"ok\":true}");
   }
 }
 
 void handleJam() {
   if (server.hasArg("on") && server.arg("on") == "1") {
+    if (!cc1101_ok) { sendJson("{\"ok\":false,\"error\":\"CC1101 khong ket noi\"}"); return; }
     if (server.hasArg("freq")) {
       float f = server.arg("freq").toFloat();
       for (int i = 0; i < numFrequencies; i++) {
@@ -695,6 +760,22 @@ void handleJam() {
   }
 }
 
+void handleTxPower() {
+  if (server.hasArg("db")) {
+    int p = (int)(server.arg("db").toFloat() * 10);
+    switch (p) {
+      case 85: case 110: case 130: case 150: case 170: case 195:
+        wifiTxPowerDbx10 = p;
+        EEPROM.write(EEPROM_SIZE - 1, (byte)p);
+        EEPROM.commit();
+        applyTxPower();
+        sendJson(String("{\"ok\":true,\"db\":") + String(wifiTxPowerDbx10 / 10.0) + "}");
+        return;
+    }
+  }
+  sendJson("{\"ok\":false,\"error\":\"Gia tri khong hop le\"}");
+}
+
 void handleAutoSave() {
   autoSave = !autoSave;
   sendJson(String("{\"ok\":true,\"on\":") + (autoSave ? "true}" : "false}"));
@@ -709,29 +790,23 @@ void handleNotFound() { server.send(404, "text/plain", "404 Not Found"); }
 
 // ===================== SETUP / LOOP =====================
 void setup() {
+  // Den LED bao hieu ngay khi khoi dong
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
   Serial.begin(115200);
-  Serial.println(F("ESP-GRABER Web starting..."));
+  Serial.println();
+  Serial.println(F("========== ESP-GRABER Web =========="));
 
-  EEPROM.begin(EEPROM_SIZE);
-  byte read_count = EEPROM.read(0);
-  EEPROM_key_count = (read_count <= MAX_KEY_COUNT) ? read_count : 0;
-  EEPROM_key_index = EEPROM.read(1);
-  if (EEPROM_key_count > 0 && EEPROM_key_index <= EEPROM_key_count && EEPROM_key_index > 0) {
-    EEPROM_get_key(EEPROM_key_index, &keyData1);
-  } else {
-    EEPROM_key_count = 0;
-    EEPROM_key_index = 0;
-    memset(&keyData1, 0, sizeof(tpKeyData));
-  }
-
-  setupCC1101();
-  rcswitch.enableReceive(CC1101_GDO0);
-
+  // ==== 1. WIFI BAT TRUOC TAT CA - dam bao luon vao duoc web UI ====
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  bool apOK = WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print(F("WiFi AP: "));
+  Serial.println(apOK ? F("OK") : F("FAIL"));
   Serial.print(F("AP IP: "));
   Serial.println(WiFi.softAPIP());
 
+  // ==== 2. Web server chay ngay ====
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/recv", HTTP_GET, handleRecv);
@@ -742,16 +817,54 @@ void setup() {
   server.on("/api/analyzer", HTTP_GET, handleAnalyzer);
   server.on("/api/jam", HTTP_GET, handleJam);
   server.on("/api/autosave", HTTP_GET, handleAutoSave);
+  server.on("/api/txpower", HTTP_GET, handleTxPower);
   server.on("/api/clear", HTTP_GET, handleClear);
   server.onNotFound(handleNotFound);
   server.begin();
-  Serial.println(F("Web server started"));
+  Serial.println(F("Web server: OK"));
+
+  // ==== 3. EEPROM ====
+  EEPROM.begin(EEPROM_SIZE);
+  // Cong suat phat WiFi (luu o EEPROM_SIZE-1, mac dinh 13 dBm)
+  {
+    int savedPwr = EEPROM.read(EEPROM_SIZE - 1);
+    switch (savedPwr) {
+      case 85: case 110: case 130: case 150: case 170: case 195:
+        wifiTxPowerDbx10 = savedPwr; break;
+      default: wifiTxPowerDbx10 = 130; break;
+    }
+    applyTxPower();
+  }
+  byte read_count = EEPROM.read(0);
+  EEPROM_key_count = (read_count <= MAX_KEY_COUNT) ? read_count : 0;
+  EEPROM_key_index = EEPROM.read(1);
+  if (EEPROM_key_count > 0 && EEPROM_key_index <= EEPROM_key_count && EEPROM_key_index > 0) {
+    EEPROM_get_key(EEPROM_key_index, &keyData1);
+  } else {
+    EEPROM_key_count = 0;
+    EEPROM_key_index = 0;
+    memset(&keyData1, 0, sizeof(tpKeyData));
+  }
+  Serial.print(F("EEPROM keys: ")); Serial.println(EEPROM_key_count);
+
+  // ==== 4. CC1101 - kiem tra phan hoi, KHONG chan WiFi neu loi ====
+  setupCC1101();
+  cc1101_ok = checkCC1101();
+  if (cc1101_ok) {
+    Serial.println(F("CC1101: OK"));
+  } else {
+    Serial.println(F("CC1101: KHONG phan hoi! Kiem tra day SCK=4 MISO=6 MOSI=7 CS=5 GDO0=10, VCC=3.3V"));
+    Serial.println(F("Web UI van hoat dong, chi cac tinh nang RF bi vo hieu."));
+  }
+
+  Serial.println(F("========== SAN SANG =========="));
 }
 
 void loop() {
   server.handleClient();
+  heartbeatLed();
 
-  if (mode == MODE_RECV) {
+  if (mode == MODE_RECV && cc1101_ok) {
     if (rcswitch.available()) {
       if (!readRAW) read_rcswitch(&keyData1);
       else read_raw(&keyData1);
@@ -765,7 +878,7 @@ void loop() {
         }
       }
     }
-  } else if (mode == MODE_ANALYZER) {
+  } else if (mode == MODE_ANALYZER && cc1101_ok) {
     if (millis() - scanTimer >= 250) {
       int rssi = ELECHOUSE_cc1101.getRssi();
       if (rssi >= rssi_threshold) {
